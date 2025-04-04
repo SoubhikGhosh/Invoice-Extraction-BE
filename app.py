@@ -1,20 +1,14 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import google.generativeai as genai
 import os
-import uuid
-import tempfile
 import logging
-import time
-import shutil
-import csv
 import io
-import pandas as pd
-from typing import List, Dict, Any, Optional
+import csv
+from typing import Dict, Any
 from datetime import datetime
 from pdf2image import convert_from_bytes
-from PIL import Image
 import uvicorn
 
 # Configure logging
@@ -44,9 +38,6 @@ app.add_middleware(
 # Configure Google API - replace with your API key
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "AIzaSyD2ArK74wBtL1ufYmpyrV2LqaOBrSi3mlU")
 genai.configure(api_key=GOOGLE_API_KEY)
-
-# Active jobs tracking
-active_jobs = {}
 
 class InvoiceProcessor:
     """Helper class for invoice processing operations using Gemini's multimodal capabilities"""
@@ -230,91 +221,12 @@ class InvoiceProcessor:
             logger.error(f"JSON decode error: {str(e)}, Text: {text[:100]}...")
             return {}
 
-async def process_invoice_task(file_data: bytes, file_type: str, file_name: str, job_id: str, output_path: str):
-    """Background task to process an invoice and save results to CSV."""
-    try:
-        result = InvoiceProcessor.process_document(file_data, file_type, file_name)
-        
-        # Create CSV file
-        with open(output_path, 'w', newline='', encoding='utf-8') as csvfile:
-            # Create CSV writer with escaped characters
-            writer = csv.writer(csvfile, quoting=csv.QUOTE_MINIMAL)
-            
-            # Write header
-            writer.writerow(['File Name', 'Field Label', 'Value', 'Confidence', 'Reason'])
-            
-            # Write extracted fields
-            for field in result.get("extracted_fields", []):
-                writer.writerow([
-                    file_name,
-                    field.get("label", ""),
-                    field.get("value", ""),
-                    field.get("confidence", ""),
-                    field.get("reason", "")
-                ])
-            
-            # Write table data
-            for table in result.get("tables", []):
-                table_name = table.get("table_name", "Unknown Table")
-                headers = table.get("headers", [])
-                
-                # Write a separator row
-                writer.writerow([file_name, f"TABLE: {table_name}", "", table.get("confidence", ""), table.get("reason", "")])
-                
-                # Write headers
-                if headers:
-                    writer.writerow([file_name, "TABLE HEADERS", ", ".join(headers), "", ""])
-                
-                # Write each row
-                for i, row in enumerate(table.get("rows", [])):
-                    writer.writerow([
-                        file_name,
-                        f"TABLE ROW {i+1}",
-                        ", ".join(str(cell) for cell in row),
-                        "",
-                        ""
-                    ])
-            
-            # Write language information
-            if result.get("is_multilingual", False):
-                writer.writerow([
-                    file_name,
-                    "LANGUAGE INFO",
-                    f"Original: {result.get('original_language', 'unknown')}",
-                    "",
-                    "Translation was performed"
-                ])
-                
-                # Add translated text
-                if result.get("translation"):
-                    writer.writerow([
-                        file_name,
-                        "TRANSLATED TEXT",
-                        result.get("translation", ""),
-                        "",
-                        ""
-                    ])
-        
-        # Update job status
-        active_jobs[job_id]["status"] = "completed"
-        active_jobs[job_id]["output_path"] = output_path
-        active_jobs[job_id]["completed_at"] = datetime.now().isoformat()
-        
-        logger.info(f"Job {job_id} completed: {file_name}")
-        
-    except Exception as e:
-        logger.error(f"Error processing invoice {file_name}: {str(e)}")
-        active_jobs[job_id]["status"] = "failed"
-        active_jobs[job_id]["error"] = str(e)
-
-@app.post("/upload/")
-async def upload_invoice(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+@app.post("/process-invoice/")
+async def process_invoice(file: UploadFile = File(...)):
     """
-    Upload an invoice document for OCR processing.
+    Upload and process an invoice document, returning extraction results as CSV.
     
     Supports PDF, JPG, PNG, and TIFF formats.
-    
-    Returns a job ID that can be used to check status and download results.
     """
     try:
         # Validate file type
@@ -342,78 +254,88 @@ async def upload_invoice(background_tasks: BackgroundTasks, file: UploadFile = F
         # Read file content
         file_data = await file.read()
         
-        # Generate job ID
-        job_id = str(uuid.uuid4())
+        # Process the invoice
+        logger.info(f"Processing invoice: {filename}")
+        result = InvoiceProcessor.process_document(file_data, mime_type, filename)
         
-        # Create output directory
-        temp_dir = tempfile.mkdtemp(prefix=f"invoice_ocr_{job_id}_")
-        output_path = os.path.join(temp_dir, f"invoice_extraction_results_{job_id}.csv")
+        if "error" in result:
+            raise HTTPException(status_code=500, detail=result["error"])
         
-        # Store job in active jobs
-        active_jobs[job_id] = {
-            "id": job_id,
-            "filename": filename,
-            "status": "processing",
-            "submitted_at": datetime.now().isoformat(),
-            "temp_dir": temp_dir,
-            "output_path": None
-        }
+        # Create CSV in memory
+        output = io.StringIO()
+        writer = csv.writer(output, quoting=csv.QUOTE_MINIMAL)
         
-        # Start background processing
-        background_tasks.add_task(
-            process_invoice_task,
-            file_data,
-            mime_type,
-            filename,
-            job_id,
-            output_path
+        # Write header
+        writer.writerow(['File Name', 'Field Label', 'Value', 'Confidence', 'Reason'])
+        
+        # Write extracted fields
+        for field in result.get("extracted_fields", []):
+            writer.writerow([
+                filename,
+                field.get("label", ""),
+                field.get("value", ""),
+                field.get("confidence", ""),
+                field.get("reason", "")
+            ])
+        
+        # Write table data
+        for table in result.get("tables", []):
+            table_name = table.get("table_name", "Unknown Table")
+            headers = table.get("headers", [])
+            
+            # Write a separator row
+            writer.writerow([filename, f"TABLE: {table_name}", "", table.get("confidence", ""), table.get("reason", "")])
+            
+            # Write headers
+            if headers:
+                writer.writerow([filename, "TABLE HEADERS", ", ".join(headers), "", ""])
+            
+            # Write each row
+            for i, row in enumerate(table.get("rows", [])):
+                writer.writerow([
+                    filename,
+                    f"TABLE ROW {i+1}",
+                    ", ".join(str(cell) for cell in row),
+                    "",
+                    ""
+                ])
+        
+        # Write language information
+        if result.get("is_multilingual", False):
+            writer.writerow([
+                filename,
+                "LANGUAGE INFO",
+                f"Original: {result.get('original_language', 'unknown')}",
+                "",
+                "Translation was performed"
+            ])
+            
+            # Add translated text
+            if result.get("translation"):
+                writer.writerow([
+                    filename,
+                    "TRANSLATED TEXT",
+                    result.get("translation", ""),
+                    "",
+                    ""
+                ])
+        
+        # Reset pointer to start of file
+        output.seek(0)
+        
+        # Return CSV as streaming response
+        logger.info(f"Returning CSV results for: {filename}")
+        return StreamingResponse(
+            io.StringIO(output.getvalue()),
+            media_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename=invoice_extraction_results_{filename}.csv"}
         )
-        
-        return {
-            "status": "success",
-            "message": "Invoice uploaded and processing started",
-            "job_id": job_id,
-            "filename": filename
-        }
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error uploading invoice: {str(e)}")
+        logger.error(f"Error processing invoice: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
-
-@app.get("/status/{job_id}")
-async def get_job_status(job_id: str):
-    """Get the status of a processing job."""
-    if job_id not in active_jobs:
-        raise HTTPException(status_code=404, detail=f"Job ID {job_id} not found")
-        
-    return active_jobs[job_id]
-
-@app.get("/download/{job_id}")
-async def download_results(job_id: str):
-    """Download the results of a completed job."""
-    if job_id not in active_jobs:
-        raise HTTPException(status_code=404, detail=f"Job ID {job_id} not found")
-        
-    job = active_jobs[job_id]
-    
-    if job["status"] != "completed":
-        raise HTTPException(
-            status_code=400,
-            detail=f"Job is not completed. Current status: {job['status']}"
-        )
-        
-    output_path = job["output_path"]
-    
-    if not output_path or not os.path.exists(output_path):
-        raise HTTPException(status_code=404, detail="Output file not found")
-        
-    return FileResponse(
-        path=output_path,
-        filename=f"invoice_extraction_results_{job_id}.csv",
-        media_type="text/csv"
-    )
 
 @app.get("/health")
 async def health_check():
@@ -423,43 +345,6 @@ async def health_check():
         "timestamp": datetime.now().isoformat(),
         "api_version": "1.0.0"
     }
-
-# Cleanup task to remove temporary files
-@app.on_event("startup")
-async def startup_event():
-    @app.get("/cleanup")
-    async def cleanup_old_jobs():
-        """Remove temporary files from completed jobs older than 24 hours."""
-        current_time = datetime.now()
-        jobs_to_remove = []
-        
-        for job_id, job in active_jobs.items():
-            if job["status"] in ["completed", "failed"]:
-                # Parse the completion timestamp
-                if "completed_at" in job:
-                    completed_time = datetime.fromisoformat(job["completed_at"])
-                    # If job is older than 24 hours
-                    if (current_time - completed_time).total_seconds() > 86400:  # 24 hours
-                        # Clean up temp directory
-                        temp_dir = job.get("temp_dir")
-                        if temp_dir and os.path.exists(temp_dir):
-                            try:
-                                shutil.rmtree(temp_dir)
-                                logger.info(f"Cleaned up temp directory for job {job_id}")
-                            except Exception as e:
-                                logger.error(f"Error cleaning up temp directory for job {job_id}: {str(e)}")
-                        
-                        jobs_to_remove.append(job_id)
-        
-        # Remove cleaned up jobs from tracking
-        for job_id in jobs_to_remove:
-            active_jobs.pop(job_id, None)
-            
-        return {
-            "status": "success",
-            "message": f"Cleaned up {len(jobs_to_remove)} old jobs",
-            "cleaned_jobs": jobs_to_remove
-        }
 
 if __name__ == "__main__":
     uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
