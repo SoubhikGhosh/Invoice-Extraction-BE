@@ -42,7 +42,7 @@ app.add_middleware(
 )
 
 # Configure Google API - replace with your API key
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "YOUR_API_KEY_HERE")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "AIzaSyD2ArK74wBtL1ufYmpyrV2LqaOBrSi3mlU")
 genai.configure(api_key=GOOGLE_API_KEY)
 
 # Active jobs tracking
