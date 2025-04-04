@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+python-multipart
+google-generativeai
+pdf2image
+Pillow
+pandas
+python-dateutil
+typing-extensions
+pydantic
+aiofiles
+poppler-utils
