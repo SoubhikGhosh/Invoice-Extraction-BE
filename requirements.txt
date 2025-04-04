@@ -5,6 +5,7 @@ google-generativeai
 pdf2image
 Pillow
 pandas
+psycopg2-binary
 python-dateutil
 typing-extensions
 pydantic
